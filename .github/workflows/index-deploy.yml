@@ -2,7 +2,7 @@ name: Index deployment to Elasticsearch
 
 on:
   push:
-    branches: [master]
+    branches: [main]
 
 jobs:
   index:
