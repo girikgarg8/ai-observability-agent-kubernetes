@@ -680,7 +680,7 @@ spec:
             memory: 100Mi
           limits:
             cpu: 200m
-            memory: 100Mi
+            memory: 10Mi
 ---
 apiVersion: v1
 kind: Service
