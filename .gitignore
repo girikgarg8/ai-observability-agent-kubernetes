@@ -2,3 +2,6 @@
 *.swp
 .env
 .env.*
+
+# Demo recording script (personal use — includes resume/LinkedIn notes)
+project_recording.md

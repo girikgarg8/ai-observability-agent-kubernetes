@@ -25,7 +25,7 @@ git push bad commit
                                               │
                                         paymentservice pod
                                               │
-                                        OOMKilled (24Mi limit)
+                                        OOMKilled (10Mi limit)
                                               │
                                         OTel DaemonSet → ships crash to logs-* (ES)
                                               │
@@ -151,6 +151,8 @@ kubectl get nodes -o wide
 | `Insufficient cpu/memory` on describe pod | Same | Scale up instance type or add nodes |
 
 **Cleanup**
+
+See **[Step 9 — Cleanup](#step-9--cleanup-stop-billable-resources)** for full teardown (EKS + Elastic Cloud).
 
 ```bash
 eksctl delete cluster --name "$CLUSTER_NAME" --region "$AWS_REGION"
@@ -476,17 +478,19 @@ Kibana → ☰ → **Search** → **Tools** → **Create tool**
 
 - Name: `get_crash_logs`
 - Type: **Elasticsearch query**
-- Index: `logs-*`
+- Index: `metrics-k8sclusterreceiver.otel-*`
 - ES|QL:
 
 ```esql
-FROM logs-*
-| WHERE resource.attributes.k8s.namespace.name == "online-boutique"
-| WHERE body.text LIKE "*OOMKill*" OR body.text LIKE "*memory*"
+FROM metrics-k8sclusterreceiver.otel-*
+| WHERE k8s.namespace.name == "online-boutique"
+| WHERE k8s.container.status.last_terminated_reason == "OOMKilled"
 | SORT @timestamp DESC
 | LIMIT 20
-| KEEP @timestamp, resource.attributes.k8s.deployment.name, resource.attributes.k8s.pod.name, body.text
+| KEEP @timestamp, k8s.deployment.name, k8s.pod.name, k8s.container.status.last_terminated_reason
 ```
+
+> **EKS / OTel note:** use flat `k8s.namespace.name` fields and the `metrics-k8sclusterreceiver.otel-*` index — OOMKilled is a kubelet termination reason, not application stdout.
 
 **Tool 2 — `get_deploy_history`**
 
@@ -501,8 +505,6 @@ FROM github-deployments
 | LIMIT 5
 | KEEP timestamp, author, commit_sha, service, change, diff_url
 ```
-
-> **EKS note:** if queries return empty, check field names in Kibana **Discover** — OTel field paths may differ slightly from GKE. Adjust ES|QL accordingly.
 
 ### 7b. Create the agent
 
@@ -534,9 +536,9 @@ In `release/kubernetes-manifests.yaml`, find `paymentservice` Deployment (~line 
 ```yaml
 resources:
   requests:
-    memory: 24Mi   # was 64Mi
+    memory: 10Mi   # was 64Mi
   limits:
-    memory: 24Mi   # was 128Mi
+    memory: 10Mi   # was 128Mi
 ```
 
 ```bash
@@ -574,6 +576,70 @@ Is paymentservice healthy now?
 
 ---
 
+## Step 9 — Cleanup (Stop Billable Resources)
+
+Run when you are done with the demo or no longer need the stack. **EKS and Elastic Cloud are the main cost drivers.**
+
+### 9a. Delete EKS cluster (AWS)
+
+Removes worker nodes (EC2), control plane charges, and cluster LoadBalancers (ArgoCD, frontend ELB).
+
+```bash
+export AWS_REGION=ap-south-1          # match your setup
+export CLUSTER_NAME=elastic-cloud-test
+
+# Deletes cluster, node groups, and associated AWS resources (~10–15 min)
+eksctl delete cluster --name "$CLUSTER_NAME" --region "$AWS_REGION"
+```
+
+**Verify in AWS Console:**
+
+- **EKS → Clusters** — cluster gone
+- **EC2 → Instances** — no leftover worker nodes
+- **EC2 → Load Balancers** — no orphaned ELBs from `frontend-external` or `argocd-server`
+- **EC2 → Volumes** — delete any unattached EBS volumes if present
+
+### 9b. Delete Elastic Cloud deployment
+
+Hosted Elasticsearch/Kibana is billed separately from AWS.
+
+1. Go to [cloud.elastic.co](https://cloud.elastic.co)
+2. Open deployment **`blame-the-deploy`** (or your deployment name)
+3. **Manage deployment** → **Delete deployment**
+4. Confirm deletion
+
+**Also clean up (optional but recommended):**
+
+- Kibana → **Settings** → **Security** → **API keys** — delete demo API keys
+- Remove GitHub repo secrets if decommissioning entirely:
+
+```bash
+export REPO=girikgarg8/ai-observability-agent-kubernetes
+
+gh secret delete ES_ENDPOINT --repo "$REPO"
+gh secret delete ES_API_KEY --repo "$REPO"
+```
+
+### 9c. What costs nothing to leave running
+
+| Resource | Cost |
+|----------|------|
+| GitHub repo + Actions secrets | Free (within GitHub limits) |
+| Agent Builder config | Gone with Elastic deployment |
+| Local kubeconfig / CLI tools | Free |
+
+### Cleanup order
+
+```
+1. eksctl delete cluster     ← stops AWS EC2 + ELB charges
+2. Delete Elastic deployment ← stops Elastic Cloud charges
+3. Revoke API keys + GitHub secrets (optional)
+```
+
+> **Tip:** Managed node groups cannot scale to zero. To pause between demo takes without full teardown, either leave the cluster running (costs accrue) or delete and recreate from Step 1.
+
+---
+
 ## Quick Reference
 
 ### Endpoints (fill in after setup)
@@ -604,15 +670,15 @@ argocd app sync online-boutique --force
 kubectl describe pod -n online-boutique <pod> | grep -A5 'Last State\|OOM'
 ```
 
-### ES|QL — find OOMKill events
+### ES|QL — find OOMKilled containers
 
 ```esql
-FROM logs-*
-| WHERE resource.attributes.k8s.namespace.name == "online-boutique"
-| WHERE body.text LIKE "*OOMKill*"
+FROM metrics-k8sclusterreceiver.otel-*
+| WHERE k8s.namespace.name == "online-boutique"
+| WHERE k8s.container.status.last_terminated_reason == "OOMKilled"
 | SORT @timestamp DESC
 | LIMIT 20
-| KEEP @timestamp, resource.attributes.k8s.deployment.name, body.text
+| KEEP @timestamp, k8s.deployment.name, k8s.pod.name, k8s.container.status.last_terminated_reason
 ```
 
 ### ES|QL — find recent deploys
@@ -646,3 +712,4 @@ FROM github-deployments
 | 2026-06-15 | Initial AWS runbook; Step 1 EKS with `m7i-flex.xlarge` × 3, 2-AZ fix |
 | 2026-06-15 | Step 5: GitHub-hosted runner docs + `index-deploy.yml` setup; skip upstream CI workflows |
 | 2026-06-15 | Option C: standalone repo layout — `release/` + workflow at root (matches instructor) |
+| 2026-06-15 | Step 9: full cleanup guide (EKS + Elastic Cloud + secrets) |
