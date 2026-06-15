@@ -1,0 +1,47 @@
+name: Index deployment to Elasticsearch
+
+on:
+  push:
+    branches: [master]
+
+jobs:
+  index:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Detect changed service
+        id: changed
+        run: |
+          # Parse which Deployment name changed in the manifest
+          # Strategy: look for "name: <service>" lines near changed hunks
+          CHANGED=$(git diff HEAD~1 HEAD -- release/kubernetes-manifests.yaml \
+            | grep '^+' \
+            | grep -oP 'name:\s+\K[a-z][a-z0-9-]+service' \
+            | head -1)
+
+          # Fallback: check if any known service appears in the diff at all
+          if [ -z "$CHANGED" ]; then
+            CHANGED=$(git diff HEAD~1 HEAD -- release/kubernetes-manifests.yaml \
+              | grep -oE 'paymentservice|cartservice|frontend|recommendationservice|adservice|checkoutservice|productcatalogservice|currencyservice|shippingservice|emailservice|redis-cart|loadgenerator' \
+              | head -1)
+          fi
+
+          echo "service=${CHANGED:-unknown}" >> $GITHUB_OUTPUT
+
+      - name: Push deploy event to Elasticsearch
+        run: |
+          curl -X POST "${{ secrets.ES_ENDPOINT }}/github-deployments/_doc" \
+            -H "Authorization: ApiKey ${{ secrets.ES_API_KEY }}" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"timestamp\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",
+              \"commit_sha\": \"${{ github.sha }}\",
+              \"author\": \"${{ github.actor }}\",
+              \"service\": \"${{ steps.changed.outputs.service }}\",
+              \"image_tag\": \"${{ github.sha }}\",
+              \"change\": \"${{ github.event.head_commit.message }}\",
+              \"diff_url\": \"${{ github.event.compare }}\"
+            }"
