@@ -6,14 +6,7 @@ Built on **AWS EKS**, **Elastic Cloud**, **OpenTelemetry**, **ArgoCD**, and **El
 
 ## 📺 Demo Video
 
-<!-- TODO: Replace DEMO_VIDEO_URL with your recording link (YouTube, Google Drive, etc.) -->
-
-TO BE ADDED
-
-[![Watch Demo](https://img.shields.io/badge/▶️_Watch-Demo_Video-red?style=for-the-badge&logo=youtube)](DEMO_VIDEO_URL)
-
-
-<!-- TODO: Add 1–2 sentence summary after recording -->
+[![Watch Demo](https://img.shields.io/badge/▶️_Watch-Demo_Video-red?style=for-the-badge&logo=youtube)](https://www.youtube.com/watch?v=7vkxqdj1c9A)
 
 ## 🏗️ Architecture
 
