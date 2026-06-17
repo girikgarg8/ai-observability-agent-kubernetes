@@ -1,118 +1,80 @@
-# Blame the Deploy (AWS / EKS)
+# Setup Runbook — Blame the Deploy (AWS EKS)
 
-> Push bad code → ArgoCD deploys it → pod OOMKills → ask the AI agent → it tells you who broke it, what changed, and how to fix it.
+End-to-end guide to reproduce the AI observability stack: **AWS EKS**, **Elastic Cloud**, **OpenTelemetry**, **ArgoCD**, **GitHub Actions**, and **Elastic Agent Builder**.
 
-AWS-adapted runbook based on [piyushsachdeva/AI-observability SETUP.md](https://github.com/piyushsachdeva/AI-observability/blob/main/SETUP.md).  
-**Living document** — AWS-specific steps are added/updated here as we go.
-
-| Instructor (GCP) | This guide (AWS) |
-|------------------|------------------|
-| GKE zonal cluster | **Amazon EKS** (regional, 2+ AZs required) |
-| `e2-standard-4` × 3 | **`m7i-flex.xlarge` × 3** (4 vCPU, 16 GiB each) |
-| GCP Marketplace → Elastic | Elastic Cloud hosted on **AWS** (or [elastic.co](https://cloud.elastic.co) direct) |
-| `gcloud` | **`aws` CLI + `eksctl`** |
+**Repo:** [github.com/girikgarg8/ai-observability-agent-kubernetes](https://github.com/girikgarg8/ai-observability-agent-kubernetes)
 
 ---
 
-## How It Works
+## Overview
+
+A single `git push` triggers two paths:
+
+1. **ArgoCD** deploys manifests to EKS  
+2. **GitHub Actions** indexes deploy metadata to Elasticsearch  
+
+OpenTelemetry ships cluster telemetry to the same Elastic deployment. When a pod fails, Agent Builder correlates crash data with deploy history.
 
 ```
-git push bad commit
-       │
-       ├──► GitHub Actions → indexes commit to github-deployments (ES)
-       │
-       └──► ArgoCD (polls every 30s) → deploys to EKS cluster
-                                              │
-                                        paymentservice pod
-                                              │
-                                        OOMKilled (10Mi limit)
-                                              │
-                                        OTel DaemonSet → ships crash to logs-* (ES)
-                                              │
-                                   ┌──────────┴──────────┐
-                                logs-*          github-deployments
-                                   └──────────┬──────────┘
-                                              │
-                                        Agent Builder
-                                              │
-                              "commit a3f92b by @author — that's the cause"
+git push
+   ├── GitHub Actions → github-deployments (Elasticsearch)
+   └── ArgoCD → EKS → OTel → Elastic Cloud
+                              │
+                        Agent Builder (on-demand triage)
 ```
 
-| Component | What it does |
-|-----------|--------------|
-| **EKS Cluster** | Runs 12 microservices + ArgoCD + OTel |
-| **Online Boutique** | Google's demo e-commerce app — the thing we break |
-| **ArgoCD** | Watches GitHub repo, auto-deploys every push |
-| **OTel kube-stack** | Collects all pod logs + metrics → ships to Elastic Cloud |
-| **`github-deployments`** | Custom ES index — stores who deployed what and when |
-| **`logs-*`** | Pod logs in Elasticsearch — OOMKill events live here |
-| **Agent Builder** | AI agent — correlates crash logs with deploy history |
+**Setup order:**
 
-**Why the order matters:**
+| Must be first | Depends on |
+|---------------|------------|
+| EKS | — |
+| Elastic Cloud | — |
+| Deploy index + GitHub secrets | Elastic Cloud |
+| OTel kube-stack | Elastic Cloud (needs endpoint + API key) |
+| ArgoCD + Online Boutique | EKS + manifests on GitHub |
+| Agent Builder | Elastic Cloud + both data sources populated |
 
-1. Manifest must be pushed to GitHub **before** ArgoCD is created — ArgoCD deploys whatever is in the repo at first sync
-2. Elastic Cloud must exist **before** OTel — OTel needs the endpoint + API key to send logs
-3. `github-deployments` index must exist **before** GitHub secrets are added — first push writes to it
-4. Everything must be running **before** the demo — agent needs data in both indices
+**Online Boutique does not require OTel.** ArgoCD can deploy the app as soon as EKS is ready. OTel can be installed later — it will start collecting telemetry from pods that are already running. You only need OTel in place **before the demo**, so crash data appears in Elasticsearch.
+
+A valid order: `EKS → Elastic Cloud → ArgoCD (app running) → OTel → deploy index → Agent Builder`
 
 ---
 
 ## Prerequisites
 
+| Tool | Purpose |
+|------|---------|
+| [AWS CLI](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html) | EKS access |
+| [eksctl](https://eksctl.io/) | Cluster provisioning |
+| [kubectl](https://kubernetes.io/docs/tasks/tools/) | Cluster operations |
+| [helm](https://helm.sh/) | OTel kube-stack |
+| [argocd CLI](https://argo-cd.readthedocs.io/en/stable/cli_installation/) | GitOps |
+| [gh](https://cli.github.com/) | GitHub secrets |
+
 ```bash
-# AWS CLI
-brew install awscli                             # macOS
-# Linux: https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html
-aws configure                                   # or: aws sso login
-aws sts get-caller-identity                     # verify credentials
+aws sts get-caller-identity    # verify AWS credentials
+gh auth status                 # verify GitHub CLI
+```
 
-# eksctl
-brew install eksctl                             # macOS
-# Linux:
-curl --silent --location "https://github.com/weaveworks/eksctl/releases/latest/download/eksctl_$(uname -s)_amd64.tar.gz" | tar xz -C /tmp
-sudo mv /tmp/eksctl /usr/local/bin
+### Environment variables
 
-# kubectl
-brew install kubectl                            # macOS
-# Linux:
-curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
-chmod +x kubectl && sudo mv kubectl /usr/local/bin/
+Set once and reuse across steps:
 
-# helm
-brew install helm                               # macOS
-curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash  # Linux
-
-# argocd CLI
-brew install argocd                             # macOS
-# Linux:
-curl -sSL -o argocd https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
-chmod +x argocd && sudo mv argocd /usr/local/bin/
-
-# gh CLI
-brew install gh && gh auth login                # macOS
-sudo apt install gh -y && gh auth login         # Linux
-
-# git
-git config --global user.name "your-username"
-git config --global user.email "your@email.com"
+```bash
+export AWS_REGION=ap-south-1
+export CLUSTER_NAME=elastic-cloud-test
+export GITHUB_REPO=girikgarg8/ai-observability-agent-kubernetes
 ```
 
 ---
 
 ## Step 1 — EKS Cluster
 
-**GCP equivalent:** `gcloud container clusters create` + `e2-standard-4` node pool × 3 in `us-central1-a`.
-
-**AWS notes:**
-
-- EKS control plane requires **at least 2 availability zones** (unlike GKE zonal clusters).
-- `m7i-flex.xlarge` ≈ `e2-standard-4` (4 vCPU, 16 GiB) — do **not** use `m7i-flex.large` (2 vCPU); Online Boutique + OTel + ArgoCD need ~6+ vCPU total.
-- Cluster creation takes **~15–20 minutes**.
+- EKS requires **≥2 availability zones**
+- Use **`m7i-flex.xlarge`** (4 vCPU, 16 GiB) — `large` is too small for 12 microservices + OTel + ArgoCD
+- Cluster creation: **~15–20 minutes**
 
 ```bash
-export AWS_REGION=ap-south-1          # change if needed; keep Elastic region aligned
-export CLUSTER_NAME=elastic-cloud-test
-
 eksctl create cluster \
   --name "$CLUSTER_NAME" \
   --region "$AWS_REGION" \
@@ -126,233 +88,85 @@ eksctl create cluster \
   --managed \
   --with-oidc
 
-# Connect kubectl (GCP equivalent: gcloud container clusters get-credentials)
-aws eks update-kubeconfig \
-  --region "$AWS_REGION" \
-  --name "$CLUSTER_NAME"
-
-# Verify — expect 3 nodes, Status: Ready
-kubectl get nodes -o wide
+aws eks update-kubeconfig --region "$AWS_REGION" --name "$CLUSTER_NAME"
+kubectl get nodes
 ```
 
-**Optional:** pin all worker nodes to a single AZ (closer to instructor's zonal GKE setup):
+**Verify:** 3 nodes, `Ready`.
 
-```bash
-# Add this flag to eksctl create cluster above:
-#   --node-zones "${AWS_REGION}a"
-```
-
-**Troubleshooting**
-
-| Symptom | Cause | Fix |
-|---------|-------|-----|
-| `only 1 zone(s) specified ... 2 are required` | EKS needs 2+ AZs for control plane | Use `--zones "${AWS_REGION}a,${AWS_REGION}b"` |
-| Pods stuck `Pending` | Nodes too small | Use `m7i-flex.xlarge`, not `large` |
-| `Insufficient cpu/memory` on describe pod | Same | Scale up instance type or add nodes |
-
-**Cleanup**
-
-See **[Step 9 — Cleanup](#step-9--cleanup-stop-billable-resources)** for full teardown (EKS + Elastic Cloud).
-
-```bash
-eksctl delete cluster --name "$CLUSTER_NAME" --region "$AWS_REGION"
-```
+| Symptom | Fix |
+|---------|-----|
+| `only 1 zone(s) specified ... 2 are required` | Add `--zones "${AWS_REGION}a,${AWS_REGION}b"` |
+| Pods `Pending` / `Insufficient cpu/memory` | Use `m7i-flex.xlarge`, not `large` |
 
 ---
 
-## Step 2 — This Repo (standalone, matches instructor layout)
-
-Same structure as [piyushsachdeva/AI-observability](https://github.com/piyushsachdeva/AI-observability) — Online Boutique manifests + workflow + docs at **repo root**, not nested inside a monorepo.
-
-```
-ai-observability-agent-kubernetes/
-├── SETUP.md
-├── README.md
-├── release/
-│   └── kubernetes-manifests.yaml    ← ArgoCD deploys this (path: release)
-└── .github/workflows/
-    └── index-deploy.yml             ← GitHub Actions (GitHub-hosted runner)
-```
-
-**Pre-configured in `release/kubernetes-manifests.yaml` (from instructor):**
-
-- All 12 Online Boutique services (public container images — work on EKS)
-- `strategy: type: Recreate` on cartservice, paymentservice, frontend, recommendationservice
-- No Istio manifests (not needed)
-
-**Only workflow needed:** `index-deploy.yml` — no upstream `ci-main.yaml`, `ci-pr.yaml`, etc.
-
-### 2a. Publish as its own GitHub repo
-
-This folder currently lives inside `DevOps-Projects/`. Publish it as a **separate repo** so GitHub Actions and ArgoCD can use standard paths.
-
-```bash
-cd /Users/ggarg1/Personal/DevOps-Projects/ai-observability-agent-kubernetes
-
-# Initialize git in this folder (separate from DevOps-Projects monorepo)
-git init
-git branch -M main
-git add SETUP.md README.md .gitignore release/ .github/
-git commit -m "Initial commit: Blame the Deploy on AWS EKS"
-
-# Create GitHub repo and push (requires: gh auth login)
-gh repo create ai-observability-agent-kubernetes \
-  --public \
-  --source=. \
-  --remote=origin \
-  --description "AI observability agent: correlate K8s crashes with Git commits (AWS EKS + Elastic)" \
-  --push
-```
-
-Result: **`https://github.com/girikgarg8/ai-observability-agent-kubernetes`**
-
-Use this repo URL everywhere below (ArgoCD, `gh secret set`, etc.).
-
-### 2b. Optional — stop tracking in DevOps-Projects monorepo
-
-If you don't want two copies, add to `DevOps-Projects/.gitignore`:
-
-```
-ai-observability-agent-kubernetes/
-```
-
-Then remove from the monorepo index (keeps files on disk):
-
-```bash
-cd /Users/ggarg1/Personal/DevOps-Projects
-git rm -r --cached ai-observability-agent-kubernetes
-git commit -m "Move ai-observability to standalone repo"
-```
-
-> **Do not edit manifests yet.** Come back in Step 8 (demo loop) to break `paymentservice` memory limits.
-
-**EKS notes:**
-
-1. **LoadBalancer delay** — `frontend-external` stays `<pending>` for **2–5 min** on EKS while AWS provisions the ELB.
-2. **Images are public** — `us-central1-docker.pkg.dev/google-samples/...` pulls work on EKS without changes.
-
----
-
-## Step 3 — Elastic Cloud
-
-> _AWS-specific provider/region selection TBD._
-
-### 3a. Create deployment
+## Step 2 — Elastic Cloud
 
 1. [cloud.elastic.co](https://cloud.elastic.co) → **Create deployment**
-2. Provider: **AWS** | Region: **`ap-south-1`** (match EKS region) | Name: `blame-the-deploy`
+2. Provider: **AWS** | Region: **`ap-south-1`** (match EKS) | Name: `blame-the-deploy`
 3. Solution: **Elastic for Observability**
-4. Click **Create** → **save the `elastic` password immediately** (shown once only)
+4. Save the `elastic` password (shown once)
 
-### 3b. Get your endpoints
+### Collect endpoints
 
-From `cloud.elastic.co` → click your deployment:
-
-| What | Where to find it | Used for |
-|------|------------------|----------|
-| Elasticsearch endpoint | Under **Elasticsearch** → **Copy endpoint** | GitHub secret `ES_ENDPOINT`, curl commands |
-| OTLP ingest endpoint | **Integrations** → **Manage** → **APM** → OTLP endpoint | OTel secret `elastic_otlp_endpoint` |
-
-### 3c. Create API key
-
-Kibana → **Settings** (bottom left) → **Security** → **API keys** → **Create API key**
-
-Verify:
+| Variable | Where to find |
+|----------|---------------|
+| `ES_ENDPOINT` | Deployment → **Elasticsearch** → Copy endpoint |
+| `OTLP_ENDPOINT` | **Integrations** → **Manage** → **APM** → OTLP endpoint |
+| `ES_API_KEY` | Kibana → **Settings** → **Security** → **API keys** → Create |
 
 ```bash
 curl -s -w "\nHTTP:%{http_code}" \
-  -X GET "<YOUR-ES-ENDPOINT>" \
-  -H "Authorization: ApiKey <YOUR-API-KEY>"
+  -X GET "$ES_ENDPOINT" \
+  -H "Authorization: ApiKey $ES_API_KEY"
 # Expect: HTTP:200
 ```
 
 ---
 
-## Step 4 — OpenTelemetry Kube-Stack
+## Step 3 — OpenTelemetry Kube-Stack
 
-Ships all pod logs + metrics from EKS to Elastic Cloud. Install once, never touch again.
+Collects pod logs and Kubernetes metrics from EKS → Elastic Cloud.
 
 ```bash
-helm repo add open-telemetry 'https://open-telemetry.github.io/opentelemetry-helm-charts' --force-update
+helm repo add open-telemetry \
+  'https://open-telemetry.github.io/opentelemetry-helm-charts' --force-update
 
 kubectl create namespace opentelemetry-operator-system
 
 kubectl create secret generic elastic-secret-otel \
   --namespace opentelemetry-operator-system \
-  --from-literal=elastic_otlp_endpoint='<YOUR-OTLP-INGEST-ENDPOINT>' \
-  --from-literal=elastic_api_key='<YOUR-API-KEY>'
+  --from-literal=elastic_otlp_endpoint="$OTLP_ENDPOINT" \
+  --from-literal=elastic_api_key="$ES_API_KEY"
 
-helm upgrade --install opentelemetry-kube-stack open-telemetry/opentelemetry-kube-stack \
+helm upgrade --install opentelemetry-kube-stack \
+  open-telemetry/opentelemetry-kube-stack \
   --namespace opentelemetry-operator-system \
   --values 'https://raw.githubusercontent.com/elastic/elastic-agent/refs/tags/v9.3.3/deploy/helm/edot-collector/kube-stack/managed_otlp/values.yaml' \
   --version '0.12.4'
 ```
 
-> If Helm fails with conflict: `helm uninstall opentelemetry-kube-stack -n opentelemetry-operator-system` then reinstall.
-
-Verify:
+**Verify:**
 
 ```bash
 kubectl get pods -n opentelemetry-operator-system
-# Expect all Running:
-# cluster-stats-collector   1/1 Running
-# daemon-collector          1/1 Running  (×3, one per node)
-# gateway-collector         1/1 Running  (×2)
-# opentelemetry-operator    2/2 Running
+# Expect: cluster-stats-collector, daemon-collector (×nodes), gateway-collector, operator — all Running
 ```
+
+> Helm conflict: `helm uninstall opentelemetry-kube-stack -n opentelemetry-operator-system` then reinstall.
 
 ---
 
-## Step 5 — GitHub Deployments Index
+## Step 4 — Deploy Metadata Index
 
-Stores who deployed what and when — the bridge between crash logs and commit history.
+The workflow `.github/workflows/index-deploy.yml` runs on every push to `main` and POSTs deploy metadata to Elasticsearch.
 
-### GitHub Actions runner — hosted by GitHub (not AWS, not self-hosted)
-
-The deploy-index workflow uses a **GitHub-hosted runner**:
-
-```yaml
-jobs:
-  index:
-    runs-on: ubuntu-latest   # ← GitHub-provided VM, not your EKS cluster
-```
-
-| Question | Answer |
-|----------|--------|
-| **Who owns the runner?** | **GitHub.** It is a temporary `ubuntu-latest` VM in GitHub's cloud, spun up for each workflow run and destroyed after. |
-| **Does it run on EKS?** | **No.** The runner never touches your cluster. It only runs `git diff` + `curl` to POST metadata to Elastic Cloud. |
-| **Do I need to install a runner?** | **No.** GitHub-hosted runners work out of the box on any public/private repo with Actions enabled. No EC2, no EKS, no self-hosted agent. |
-| **What about the author's other workflows?** | Google's upstream Online Boutique uses **self-hosted GCE runners** for build/deploy CI. We **do not** use those — only `index-deploy.yml`. |
-
-```
-push to main
-     │
-     ▼
-GitHub-hosted runner (ubuntu-latest)     ← GitHub's infrastructure
-     │  checkout repo
-     │  detect changed service
-     │  curl POST → Elastic Cloud
-     ▼
-github-deployments index
-
-(separately, on EKS)
-
-ArgoCD polls same repo → deploys manifests to cluster
-```
-
-> **Important:** ArgoCD runs **inside EKS**. GitHub Actions runs **on GitHub's runners**. They are two independent pipelines triggered by the same `git push`.
-
-### 5a. Workflow (already in this repo)
-
-`.github/workflows/index-deploy.yml` is included at repo root — triggers on push to `main`, runs on **GitHub-hosted** `ubuntu-latest`. No changes needed for AWS/EKS.
-
-After Step 2a push, verify it appears on GitHub: **Actions** tab → workflow **"Index deployment to Elasticsearch"**.
-
-### 5b. Create the index
+### 4a. Create the index
 
 ```bash
-curl -X PUT "<YOUR-ES-ENDPOINT>/github-deployments" \
-  -H "Authorization: ApiKey <YOUR-API-KEY>" \
+curl -X PUT "$ES_ENDPOINT/github-deployments" \
+  -H "Authorization: ApiKey $ES_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "mappings": {
@@ -370,62 +184,52 @@ curl -X PUT "<YOUR-ES-ENDPOINT>/github-deployments" \
 # Expect: {"acknowledged":true}
 ```
 
-### 5c. Add GitHub secrets
-
-Secrets go on **this repo** (`ai-observability-agent-kubernetes`), not `DevOps-Projects`.
+### 4b. Add GitHub secrets
 
 ```bash
-export REPO=girikgarg8/ai-observability-agent-kubernetes
-
-gh secret set ES_ENDPOINT \
-  --repo "$REPO" \
-  --body "https://<your-es-endpoint>:443"
-
-gh secret set ES_API_KEY \
-  --repo "$REPO" \
-  --body "<YOUR-API-KEY>"
+gh secret set ES_ENDPOINT --repo "$GITHUB_REPO" --body "$ES_ENDPOINT"
+gh secret set ES_API_KEY   --repo "$GITHUB_REPO" --body "$ES_API_KEY"
 ```
 
-### 5d. Test it
+### 4c. Verify indexing
 
 ```bash
-cd /Users/ggarg1/Personal/DevOps-Projects/ai-observability-agent-kubernetes
-
 git commit --allow-empty -m "test: verify ES indexing"
 git push origin main
 
-gh run list --repo girikgarg8/ai-observability-agent-kubernetes --limit 3
-# Expect: "Index deployment to Elasticsearch" → completed success
+gh run list --repo "$GITHUB_REPO" --limit 3
+# Expect: "Index deployment to Elasticsearch" → success
 
-curl -s "<YOUR-ES-ENDPOINT>/github-deployments/_count" \
-  -H "Authorization: ApiKey <YOUR-API-KEY>"
+curl -s "$ES_ENDPOINT/github-deployments/_count" \
+  -H "Authorization: ApiKey $ES_API_KEY"
 # Expect: {"count":1,...}
 ```
 
 ---
 
-## Step 6 — ArgoCD
-
-Watches the repo and auto-deploys every push to the cluster.
+## Step 5 — ArgoCD
 
 ```bash
 kubectl create namespace argocd
-kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+
+kubectl apply --server-side --force-conflicts -n argocd \
+  -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+
 kubectl rollout status deployment/argocd-server -n argocd --timeout=180s
 
-# Expose publicly (EKS provisions AWS ELB — wait 2-5 min for EXTERNAL-IP/hostname)
-kubectl patch svc argocd-server -n argocd -p '{"spec":{"type":"LoadBalancer"}}'
+kubectl patch svc argocd-server -n argocd \
+  -p '{"spec":{"type":"LoadBalancer"}}'
 kubectl get svc argocd-server -n argocd -w
+# Wait 2–5 min for ELB hostname
 
-# Get admin password
 kubectl get secret argocd-initial-admin-secret -n argocd \
-  -o jsonpath='{.data.password}' | base64 -d && echo ""
+  -o jsonpath='{.data.password}' | base64 -d && echo
 
-# Log in — use EXTERNAL-IP or ELB hostname from get svc above
-argocd login <EXTERNAL-IP-OR-HOSTNAME> --username admin --password <PASSWORD> --insecure
+argocd login <ARGOCD-ELB-HOSTNAME> \
+  --username admin --password <PASSWORD> --insecure
 ```
 
-### Create the Application
+### Create Application
 
 ```bash
 kubectl apply -f - <<EOF
@@ -451,7 +255,7 @@ spec:
 EOF
 ```
 
-### First sync + reduce poll interval
+### Sync and verify
 
 ```bash
 argocd app sync online-boutique --force --prune
@@ -461,23 +265,28 @@ kubectl patch configmap argocd-cm -n argocd --type merge \
 kubectl rollout restart deployment/argocd-repo-server -n argocd
 
 kubectl get pods -n online-boutique
-# Expect ~12 pods Running (wait 2-5 min if LoadBalancer / image pull delays)
+# Expect ~12 pods Running
+```
+
+**Frontend URL:**
+
+```bash
+kubectl get svc frontend-external -n online-boutique \
+  -o jsonpath='http://{.status.loadBalancer.ingress[0].hostname}' && echo
 ```
 
 ---
 
-## Step 7 — Agent Builder
+## Step 6 — Agent Builder
 
-Uses Elastic's native **Claude claude-sonnet-4-6** — no external LLM connector needed.
+Uses Elastic's native **Claude claude-sonnet-4-6**.
 
-### 7a. Create the tools
+### 6a. Create tools
 
 Kibana → ☰ → **Search** → **Tools** → **Create tool**
 
 **Tool 1 — `get_crash_logs`**
 
-- Name: `get_crash_logs`
-- Type: **Elasticsearch query**
 - Index: `metrics-k8sclusterreceiver.otel-*`
 - ES|QL:
 
@@ -490,12 +299,8 @@ FROM metrics-k8sclusterreceiver.otel-*
 | KEEP @timestamp, k8s.deployment.name, k8s.pod.name, k8s.container.status.last_terminated_reason
 ```
 
-> **EKS / OTel note:** use flat `k8s.namespace.name` fields and the `metrics-k8sclusterreceiver.otel-*` index — OOMKilled is a kubelet termination reason, not application stdout.
-
 **Tool 2 — `get_deploy_history`**
 
-- Name: `get_deploy_history`
-- Type: **Elasticsearch query**
 - Index: `github-deployments`
 - ES|QL:
 
@@ -506,32 +311,34 @@ FROM github-deployments
 | KEEP timestamp, author, commit_sha, service, change, diff_url
 ```
 
-### 7b. Create the agent
+### 6b. Create agent
 
 Kibana → ☰ → **Search** → **Agent Builder** → **Create agent**
 
-- **Name:** `blame-the-deploy`
-- **Model:** `Claude claude-sonnet-4-6`
-- **Instructions:**
+| Field | Value |
+|-------|-------|
+| Name | `blame-the-deploy` |
+| Model | `Claude claude-sonnet-4-6` |
+| Tools | `get_crash_logs`, `get_deploy_history` |
+
+**Instructions:**
 
 ```
 You are an SRE assistant. When asked why a service is crashing:
-1. Use get_crash_logs to find OOMKill or memory events in logs-*
-2. Use get_deploy_history to find the most recent GitHub deployment to that service
+1. Use get_crash_logs to find OOMKill or memory events
+2. Use get_deploy_history to find the most recent deployment to that service
 3. If the deploy happened shortly before the crash, that is the likely cause
 4. Report: crash time, commit SHA, author, what changed, and how to fix it
 Always cite the commit SHA and author name in your answer.
 ```
 
-Add tools: `get_crash_logs`, `get_deploy_history` → **Save**.
-
 ---
 
-## Step 8 — Run the Demo
+## Step 7 — Run the Demo
 
 ### Break it
 
-In `release/kubernetes-manifests.yaml`, find `paymentservice` Deployment (~line 631). Change memory:
+In `release/kubernetes-manifests.yaml`, find `paymentservice` Deployment (~line 631):
 
 ```yaml
 resources:
@@ -546,8 +353,6 @@ git add release/kubernetes-manifests.yaml
 git commit -m "perf: tune paymentservice memory limits for cost optimisation"
 git push origin main
 ```
-
-Watch:
 
 ```bash
 kubectl get pods -n online-boutique -w
@@ -567,110 +372,31 @@ Why is paymentservice crashing? Check the logs and recent deployments.
 ```bash
 git revert HEAD --no-edit
 git push origin main
-# Pod recovers in ~30 seconds (ArgoCD poll interval)
 ```
-
-```
-Is paymentservice healthy now?
-```
-
----
-
-## Step 9 — Cleanup (Stop Billable Resources)
-
-Run when you are done with the demo or no longer need the stack. **EKS and Elastic Cloud are the main cost drivers.**
-
-### 9a. Delete EKS cluster (AWS)
-
-Removes worker nodes (EC2), control plane charges, and cluster LoadBalancers (ArgoCD, frontend ELB).
-
-```bash
-export AWS_REGION=ap-south-1          # match your setup
-export CLUSTER_NAME=elastic-cloud-test
-
-# Deletes cluster, node groups, and associated AWS resources (~10–15 min)
-eksctl delete cluster --name "$CLUSTER_NAME" --region "$AWS_REGION"
-```
-
-**Verify in AWS Console:**
-
-- **EKS → Clusters** — cluster gone
-- **EC2 → Instances** — no leftover worker nodes
-- **EC2 → Load Balancers** — no orphaned ELBs from `frontend-external` or `argocd-server`
-- **EC2 → Volumes** — delete any unattached EBS volumes if present
-
-### 9b. Delete Elastic Cloud deployment
-
-Hosted Elasticsearch/Kibana is billed separately from AWS.
-
-1. Go to [cloud.elastic.co](https://cloud.elastic.co)
-2. Open deployment **`blame-the-deploy`** (or your deployment name)
-3. **Manage deployment** → **Delete deployment**
-4. Confirm deletion
-
-**Also clean up (optional but recommended):**
-
-- Kibana → **Settings** → **Security** → **API keys** — delete demo API keys
-- Remove GitHub repo secrets if decommissioning entirely:
-
-```bash
-export REPO=girikgarg8/ai-observability-agent-kubernetes
-
-gh secret delete ES_ENDPOINT --repo "$REPO"
-gh secret delete ES_API_KEY --repo "$REPO"
-```
-
-### 9c. What costs nothing to leave running
-
-| Resource | Cost |
-|----------|------|
-| GitHub repo + Actions secrets | Free (within GitHub limits) |
-| Agent Builder config | Gone with Elastic deployment |
-| Local kubeconfig / CLI tools | Free |
-
-### Cleanup order
-
-```
-1. eksctl delete cluster     ← stops AWS EC2 + ELB charges
-2. Delete Elastic deployment ← stops Elastic Cloud charges
-3. Revoke API keys + GitHub secrets (optional)
-```
-
-> **Tip:** Managed node groups cannot scale to zero. To pause between demo takes without full teardown, either leave the cluster running (costs accrue) or delete and recreate from Step 1.
 
 ---
 
 ## Quick Reference
 
-### Endpoints (fill in after setup)
+### Endpoints
 
-| Service | URL |
-|---------|-----|
-| Online Boutique | `http://<frontend-external ELB hostname>` |
-| ArgoCD | `https://<argocd-server ELB hostname>` → `admin` / `<password>` |
-| Kibana | `https://<deployment-id>.kb.<region>.aws.cloud.es.io` |
-| Elasticsearch | `https://<deployment-id>.<region>.aws.cloud.es.io:443` |
-
-```bash
-# Get LoadBalancer hostnames on EKS
-kubectl get svc frontend-external -n online-boutique \
-  -o jsonpath='http://{.status.loadBalancer.ingress[0].hostname}' && echo
-kubectl get svc argocd-server -n argocd \
-  -o jsonpath='https://{.status.loadBalancer.ingress[0].hostname}' && echo
-```
+| Service | How to get URL |
+|---------|----------------|
+| Online Boutique | `kubectl get svc frontend-external -n online-boutique` |
+| ArgoCD | `kubectl get svc argocd-server -n argocd` |
+| Kibana | Elastic Cloud deployment page |
+| Elasticsearch | `$ES_ENDPOINT` |
 
 ### Useful commands
 
 ```bash
-kubectl get pods -n online-boutique
 kubectl get pods -n online-boutique -w
 kubectl get pods -n opentelemetry-operator-system
 argocd app get online-boutique
-argocd app sync online-boutique --force
-kubectl describe pod -n online-boutique <pod> | grep -A5 'Last State\|OOM'
+kubectl describe pod -n online-boutique -l app=paymentservice | grep -A5 'Last State\|OOM'
 ```
 
-### ES|QL — find OOMKilled containers
+### ES|QL — OOMKilled containers
 
 ```esql
 FROM metrics-k8sclusterreceiver.otel-*
@@ -681,7 +407,7 @@ FROM metrics-k8sclusterreceiver.otel-*
 | KEEP @timestamp, k8s.deployment.name, k8s.pod.name, k8s.container.status.last_terminated_reason
 ```
 
-### ES|QL — find recent deploys
+### ES|QL — recent deploys
 
 ```esql
 FROM github-deployments
@@ -692,24 +418,49 @@ FROM github-deployments
 
 ---
 
-## AWS vs GCP cheat sheet
+## Cleanup
 
-| Instructor (GCP) | This guide (AWS) |
-|------------------|------------------|
-| `gcloud container clusters create` | `eksctl create cluster` |
-| `--zone us-central1-a` | `--zones ap-south-1a,ap-south-1b` (min 2 AZs) |
-| `e2-standard-4` × 3 | `m7i-flex.xlarge` × 3 |
-| `gcloud ... get-credentials` | `aws eks update-kubeconfig` |
-| GCP Marketplace → Elastic | Elastic Cloud on **AWS** at elastic.co |
-| GKE LoadBalancer | EKS → AWS ELB (2–5 min to provision) |
+Run when finished. **EKS and Elastic Cloud are the main cost drivers.**
 
----
+### 1. Release LoadBalancers (optional, avoids orphaned ELBs)
 
-## Changelog
+```bash
+kubectl delete svc frontend-external -n online-boutique --ignore-not-found
+kubectl delete svc argocd-server -n argocd --ignore-not-found
+# Wait 2–5 minutes
+```
 
-| Date | Change |
-|------|--------|
-| 2026-06-15 | Initial AWS runbook; Step 1 EKS with `m7i-flex.xlarge` × 3, 2-AZ fix |
-| 2026-06-15 | Step 5: GitHub-hosted runner docs + `index-deploy.yml` setup; skip upstream CI workflows |
-| 2026-06-15 | Option C: standalone repo layout — `release/` + workflow at root (matches instructor) |
-| 2026-06-15 | Step 9: full cleanup guide (EKS + Elastic Cloud + secrets) |
+### 2. Delete EKS cluster
+
+Removes control plane, node groups, VPC, NAT gateways, and cluster security groups.
+
+```bash
+eksctl delete cluster --name "$CLUSTER_NAME" --region "$AWS_REGION" --wait
+# ~10–15 minutes
+```
+
+**Verify in AWS Console:**
+
+- EKS → Clusters — gone
+- EC2 → Instances — no worker nodes
+- EC2 → Load Balancers — no orphaned ELBs
+- EC2 → Volumes — delete unattached EBS volumes if any
+
+### 3. Delete Elastic Cloud deployment
+
+1. [cloud.elastic.co](https://cloud.elastic.co) → deployment **`blame-the-deploy`**
+2. **Manage deployment** → **Delete deployment**
+
+### 4. Optional
+
+- Kibana → **API keys** — revoke demo keys
+- `gh secret delete ES_ENDPOINT --repo "$GITHUB_REPO"`
+- `gh secret delete ES_API_KEY --repo "$GITHUB_REPO"`
+
+### Cleanup order
+
+```
+1. eksctl delete cluster      → stops AWS EC2, NAT, ELB charges
+2. Delete Elastic deployment  → stops Elastic Cloud charges
+3. Revoke API keys / secrets  → optional
+```
